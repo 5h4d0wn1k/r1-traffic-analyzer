@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""R1 — Network Traffic Analyzer: PCAP parsing, flow reconstruction, protocol stats, anomaly detection, bandwidth analysis."""
+"""R1 — Network Traffic Analyzer v2.
 
-import struct
+Real pcap parsing, flow reconstruction, protocol stats, anomaly detection,
+bandwidth analysis, and JSON/Markdown reporting. Stdlib-only.
+
+Reworked into a working baseline:
+  - CLI via argparse with --help
+  - Fixture pcap generated deterministically (no external capture required)
+  - JSON + Markdown reports written to reports/ (gitignored)
+  - Deterministic offline tests
+"""
+import argparse
 import collections
 import json
+import os
+import struct
 import sys
 from datetime import datetime
 
@@ -11,106 +22,53 @@ from datetime import datetime
 class PcapParser:
     """Parse pcap files and extract raw packet data."""
 
-    MAGIC_NATIVE = 0xa1b2c3d4
-    MAGIC_SWAPPED = 0xd4c3b2a1
-    MAGIC_NANO_NATIVE = 0xa1b23c4d
-    MAGIC_NANO_SWAPPED = 0x4d3cb2a1
-    ETHERNET_HEADER_LEN = 14
-    ETHERTYPE_IP = 0x0800
-    ETHERTYPE_IPV6 = 0x86DD
-    ETHERTYPE_ARP = 0x0806
+    MAGIC_NATIVE = 0xA1B2C3D4
+    MAGIC_SWAPPED = 0xD4C3B2A1
+    MAGIC_NANO_NATIVE = 0xA1B23C4D
+    MAGIC_NANO_SWAPPED = 0x4D3CB2A1
 
     def __init__(self):
         self.global_header = {}
         self.packets = []
-        self.byte_order = '>'
+        self.byte_order = ">"
         self.nanosecond = False
 
-    def parse_file(self, filepath):
-        """Parse a pcap file and return list of packet dicts."""
-        with open(filepath, 'rb') as f:
-            magic = struct.unpack('I', f.read(4))[0]
-            if magic == self.MAGIC_NATIVE:
-                self.byte_order = '='
-            elif magic == self.MAGIC_SWAPPED:
-                self.byte_order = '>'
-            elif magic == self.MAGIC_NANO_NATIVE:
-                self.byte_order = '='
-                self.nanosecond = True
-            elif magic == self.MAGIC_NANO_SWAPPED:
-                self.byte_order = '>'
-                self.nanosecond = True
-            else:
-                raise ValueError(f"Not a valid pcap file (magic: 0x{magic:08x})")
-
-            hdr_fmt = f'{self.byte_order}HHiIII'
-            hdr_size = struct.calcsize(hdr_fmt)
-            hdr_data = f.read(hdr_size)
-            fields = struct.unpack(hdr_fmt, hdr_data)
-            self.global_header = {
-                'version_major': fields[0],
-                'version_minor': fields[1],
-                'thiszone': fields[2],
-                'sigfigs': fields[3],
-                'snaplen': fields[4],
-                'network': fields[5],
-            }
-
-            pkt_hdr_fmt = f'{self.byte_order}IIII'
-            pkt_hdr_size = struct.calcsize(pkt_hdr_fmt)
-            packet_num = 0
-            while True:
-                pkt_hdr = f.read(pkt_hdr_size)
-                if len(pkt_hdr) < pkt_hdr_size:
-                    break
-                ts_sec, ts_usec, incl_len, orig_len = struct.unpack(pkt_hdr_fmt, pkt_hdr)
-                data = f.read(incl_len)
-                if len(data) < incl_len:
-                    break
-                if self.nanosecond:
-                    ts_usec = ts_usec / 1000.0
-                self.packets.append({
-                    'number': packet_num,
-                    'timestamp': ts_sec + ts_usec / 1_000_000.0,
-                    'length': orig_len,
-                    'captured_length': incl_len,
-                    'data': data,
-                })
-                packet_num += 1
-        return self.packets
-
-    def parse_bytes(self, pcap_bytes):
-        """Parse pcap data from bytes."""
-        import io
-        f = io.BytesIO(pcap_bytes)
-        magic = struct.unpack('I', f.read(4))[0]
+    def _read_header(self, f):
+        magic_b = f.read(4)
+        if len(magic_b) < 4:
+            raise ValueError("File too short to be a pcap")
+        magic = struct.unpack("I", magic_b)[0]
         if magic == self.MAGIC_NATIVE:
-            self.byte_order = '='
+            self.byte_order = "<"
         elif magic == self.MAGIC_SWAPPED:
-            self.byte_order = '>'
+            self.byte_order = ">"
         elif magic == self.MAGIC_NANO_NATIVE:
-            self.byte_order = '='
+            self.byte_order = "<"
             self.nanosecond = True
         elif magic == self.MAGIC_NANO_SWAPPED:
-            self.byte_order = '>'
+            self.byte_order = ">"
             self.nanosecond = True
         else:
             raise ValueError(f"Not a valid pcap file (magic: 0x{magic:08x})")
 
-        hdr_fmt = f'{self.byte_order}HHiIII'
-        hdr_size = struct.calcsize(hdr_fmt)
-        hdr_data = f.read(hdr_size)
+        hdr_fmt = f"{self.byte_order}HHiIII"
+        hdr_data = f.read(struct.calcsize(hdr_fmt))
+        if len(hdr_data) < struct.calcsize(hdr_fmt):
+            raise ValueError("Truncated pcap global header")
         fields = struct.unpack(hdr_fmt, hdr_data)
         self.global_header = {
-            'version_major': fields[0],
-            'version_minor': fields[1],
-            'thiszone': fields[2],
-            'sigfigs': fields[3],
-            'snaplen': fields[4],
-            'network': fields[5],
+            "version_major": fields[0],
+            "version_minor": fields[1],
+            "thiszone": fields[2],
+            "sigfigs": fields[3],
+            "snaplen": fields[4],
+            "network": fields[5],
         }
-        pkt_hdr_fmt = f'{self.byte_order}IIII'
+
+    def _read_packets(self, f):
+        pkt_hdr_fmt = f"{self.byte_order}IIII"
         pkt_hdr_size = struct.calcsize(pkt_hdr_fmt)
+        self.packets = []
         packet_num = 0
         while True:
             pkt_hdr = f.read(pkt_hdr_size)
@@ -123,45 +81,50 @@ class PcapParser:
             if self.nanosecond:
                 ts_usec = ts_usec / 1000.0
             self.packets.append({
-                'number': packet_num,
-                'timestamp': ts_sec + ts_usec / 1_000_000.0,
-                'length': orig_len,
-                'captured_length': incl_len,
-                'data': data,
+                "number": packet_num,
+                "timestamp": ts_sec + ts_usec / 1_000_000.0,
+                "length": orig_len,
+                "captured_length": incl_len,
+                "data": data,
             })
             packet_num += 1
         return self.packets
 
+    def parse_bytes(self, pcap_bytes):
+        import io
+        f = io.BytesIO(pcap_bytes)
+        self._read_header(f)
+        return self._read_packets(f)
+
+    def parse_file(self, filepath):
+        with open(filepath, "rb") as f:
+            self._read_header(f)
+            return self._read_packets(f)
+
 
 class EthernetParser:
-    """Parse Ethernet frames."""
-
     HEADER_LEN = 14
 
     @staticmethod
     def parse(data):
-        """Parse ethernet header, return dict with dst_mac, src_mac, ethertype, payload."""
         if len(data) < 14:
             return None
-        dst_mac = ':'.join(f'{b:02x}' for b in data[0:6])
-        src_mac = ':'.join(f'{b:02x}' for b in data[6:12])
-        ethertype = struct.unpack('!H', data[12:14])[0]
+        dst_mac = ":".join(f"{b:02x}" for b in data[0:6])
+        src_mac = ":".join(f"{b:02x}" for b in data[6:12])
+        ethertype = struct.unpack("!H", data[12:14])[0]
         return {
-            'dst_mac': dst_mac,
-            'src_mac': src_mac,
-            'ethertype': ethertype,
-            'payload': data[14:],
+            "dst_mac": dst_mac,
+            "src_mac": src_mac,
+            "ethertype": ethertype,
+            "payload": data[14:],
         }
 
 
 class IPParser:
-    """Parse IPv4 headers."""
-
-    PROTOCOL_NAMES = {1: 'ICMP', 6: 'TCP', 17: 'UDP', 47: 'GRE', 50: 'ESP', 51: 'AH'}
+    PROTOCOL_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 47: "GRE", 50: "ESP", 51: "AH"}
 
     @staticmethod
     def parse(data):
-        """Parse IPv4 header, return dict with protocol fields."""
         if len(data) < 20:
             return None
         version_ihl = data[0]
@@ -171,38 +134,35 @@ class IPParser:
             return None
         if len(data) < ihl:
             return None
-        total_length = struct.unpack('!H', data[2:4])[0]
+        total_length = struct.unpack("!H", data[2:4])[0]
         protocol_num = data[9]
-        src_ip = '.'.join(str(b) for b in data[12:16])
-        dst_ip = '.'.join(str(b) for b in data[16:20])
-        protocol_name = IPParser.PROTOCOL_NAMES.get(protocol_num, f'PROTO_{protocol_num}')
+        src_ip = ".".join(str(b) for b in data[12:16])
+        dst_ip = ".".join(str(b) for b in data[16:20])
+        protocol_name = IPParser.PROTOCOL_NAMES.get(protocol_num, f"PROTO_{protocol_num}")
         return {
-            'version': version,
-            'header_length': ihl,
-            'total_length': total_length,
-            'ttl': data[8],
-            'protocol': protocol_num,
-            'protocol_name': protocol_name,
-            'src_ip': src_ip,
-            'dst_ip': dst_ip,
-            'payload': data[ihl:],
+            "version": version,
+            "header_length": ihl,
+            "total_length": total_length,
+            "ttl": data[8],
+            "protocol": protocol_num,
+            "protocol_name": protocol_name,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "payload": data[ihl:],
         }
 
 
 class TCPParser:
-    """Parse TCP headers."""
-
-    FLAGS = ['FIN', 'SYN', 'RST', 'PSH', 'ACK', 'URG', 'ECE', 'CWR']
+    FLAGS = ["CWR", "ECE", "URG", "ACK", "PSH", "RST", "SYN", "FIN"]
 
     @staticmethod
     def parse(data):
-        """Parse TCP header, return dict with port/flags."""
         if len(data) < 20:
             return None
-        src_port = struct.unpack('!H', data[0:2])[0]
-        dst_port = struct.unpack('!H', data[2:4])[0]
-        seq_num = struct.unpack('!I', data[4:8])[0]
-        ack_num = struct.unpack('!I', data[8:12])[0]
+        src_port = struct.unpack("!H", data[0:2])[0]
+        dst_port = struct.unpack("!H", data[2:4])[0]
+        seq_num = struct.unpack("!I", data[4:8])[0]
+        ack_num = struct.unpack("!I", data[8:12])[0]
         data_offset = (data[12] >> 4) & 0xF
         header_len = data_offset * 4
         flags_raw = data[13]
@@ -210,107 +170,91 @@ class TCPParser:
         for i, name in enumerate(TCPParser.FLAGS):
             if flags_raw & (0x80 >> i):
                 flags.append(name)
-        window = struct.unpack('!H', data[14:16])[0]
+        window = struct.unpack("!H", data[14:16])[0]
         return {
-            'src_port': src_port,
-            'dst_port': dst_port,
-            'seq_num': seq_num,
-            'ack_num': ack_num,
-            'header_length': header_len,
-            'flags': flags,
-            'flags_raw': flags_raw,
-            'window': window,
-            'payload': data[header_len:],
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "seq_num": seq_num,
+            "ack_num": ack_num,
+            "header_length": header_len,
+            "flags": flags,
+            "flags_raw": flags_raw,
+            "window": window,
+            "payload": data[header_len:],
         }
 
 
 class UDPParser:
-    """Parse UDP headers."""
-
     @staticmethod
     def parse(data):
-        """Parse UDP header, return dict with ports/length."""
         if len(data) < 8:
             return None
-        src_port = struct.unpack('!H', data[0:2])[0]
-        dst_port = struct.unpack('!H', data[2:4])[0]
-        length = struct.unpack('!H', data[4:6])[0]
+        src_port = struct.unpack("!H", data[0:2])[0]
+        dst_port = struct.unpack("!H", data[2:4])[0]
+        length = struct.unpack("!H", data[4:6])[0]
         return {
-            'src_port': src_port,
-            'dst_port': dst_port,
-            'length': length,
-            'payload': data[8:],
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "length": length,
+            "payload": data[8:],
         }
 
 
 class FlowReconstructor:
-    """Reconstruct network flows from parsed packets."""
-
     def __init__(self):
         self.flows = collections.defaultdict(lambda: {
-            'packets': [],
-            'bytes_sent': 0,
-            'bytes_received': 0,
-            'src_packets': 0,
-            'dst_packets': 0,
-            'start_time': None,
-            'end_time': None,
-            'flags': set(),
-            'protocols': set(),
+            "packets": [],
+            "start_time": None,
+            "end_time": None,
+            "flags": set(),
+            "protocols": set(),
         })
 
-    def _flow_key(self, src_ip, dst_ip, src_port, dst_port, protocol):
-        """Create canonical flow key."""
+    @staticmethod
+    def _flow_key(src_ip, dst_ip, src_port, dst_port, protocol):
         parts = sorted([(src_ip, src_port), (dst_ip, dst_port)])
         return (parts[0][0], parts[0][1], parts[1][0], parts[1][1], protocol)
 
     def add_packet(self, packet, ip_info, transport_info):
-        """Add a parsed packet to the flow table."""
-        src_ip = ip_info['src_ip']
-        dst_ip = ip_info['dst_ip']
-        src_port = transport_info.get('src_port', 0)
-        dst_port = transport_info.get('dst_port', 0)
-        protocol = ip_info['protocol_name']
+        src_ip = ip_info["src_ip"]
+        dst_ip = ip_info["dst_ip"]
+        src_port = transport_info.get("src_port", 0) if transport_info else 0
+        dst_port = transport_info.get("dst_port", 0) if transport_info else 0
+        protocol = ip_info["protocol_name"]
         key = self._flow_key(src_ip, dst_ip, src_port, dst_port, protocol)
-
         flow = self.flows[key]
-        flow['packets'].append(packet['number'])
-        length = ip_info['total_length']
-        if 'flags' in transport_info:
-            flow['flags'].update(transport_info['flags'])
-        flow['protocols'].add(protocol)
-
-        if flow['start_time'] is None or packet['timestamp'] < flow['start_time']:
-            flow['start_time'] = packet['timestamp']
-        if flow['end_time'] is None or packet['timestamp'] > flow['end_time']:
-            flow['end_time'] = packet['timestamp']
-
+        flow["packets"].append(packet["number"])
+        if transport_info and "flags" in transport_info:
+            flow["flags"].update(transport_info["flags"])
+        flow["protocols"].add(protocol)
+        if flow["start_time"] is None or packet["timestamp"] < flow["start_time"]:
+            flow["start_time"] = packet["timestamp"]
+        if flow["end_time"] is None or packet["timestamp"] > flow["end_time"]:
+            flow["end_time"] = packet["timestamp"]
         return key
 
     def get_flow_stats(self):
-        """Return statistics for all flows."""
         stats = {}
         for key, flow in self.flows.items():
             src_ip, src_port, dst_ip, dst_port, protocol = key
-            duration = (flow['end_time'] - flow['start_time']) if flow['start_time'] and flow['end_time'] else 0
-            stats[key] = {
-                'src_ip': src_ip,
-                'src_port': src_port,
-                'dst_ip': dst_ip,
-                'dst_port': dst_port,
-                'protocol': protocol,
-                'packet_count': len(flow['packets']),
-                'duration': duration,
-                'start_time': flow['start_time'],
-                'end_time': flow['end_time'],
-                'flags': list(flow['flags']),
+            duration = (flow["end_time"] - flow["start_time"]) if flow["start_time"] and flow["end_time"] else 0
+            str_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}/{protocol}"
+            stats[str_key] = {
+                "src_ip": src_ip,
+                "src_port": src_port,
+                "dst_ip": dst_ip,
+                "dst_port": dst_port,
+                "protocol": protocol,
+                "packet_count": len(flow["packets"]),
+                "duration": round(duration, 6),
+                "start_time": flow["start_time"],
+                "end_time": flow["end_time"],
+                "flags": list(flow["flags"]),
             }
         return stats
 
 
 class ProtocolAnalyzer:
-    """Analyze protocol distribution and statistics."""
-
     def __init__(self):
         self.protocol_counts = collections.Counter()
         self.port_counts = collections.Counter()
@@ -320,48 +264,37 @@ class ProtocolAnalyzer:
         self.timestamps = []
 
     def analyze_packet(self, packet, ip_info=None, transport_info=None):
-        """Record statistics for a single packet."""
-        self.packet_sizes.append(packet['length'])
-        self.timestamps.append(packet['timestamp'])
+        self.packet_sizes.append(packet["length"])
+        self.timestamps.append(packet["timestamp"])
         if ip_info:
-            self.protocol_counts[ip_info['protocol_name']] += 1
-            self.ip_src_counts[ip_info['src_ip']] += 1
-            self.ip_dst_counts[ip_info['dst_ip']] += 1
+            self.protocol_counts[ip_info["protocol_name"]] += 1
+            self.ip_src_counts[ip_info["src_ip"]] += 1
+            self.ip_dst_counts[ip_info["dst_ip"]] += 1
         if transport_info:
-            src_port = transport_info.get('src_port', 0)
-            dst_port = transport_info.get('dst_port', 0)
-            self.port_counts[src_port] += 1
-            self.port_counts[dst_port] += 1
+            self.port_counts[transport_info.get("src_port", 0)] += 1
+            self.port_counts[transport_info.get("dst_port", 0)] += 1
 
     def get_stats(self):
-        """Return protocol analysis summary."""
-        total = sum(self.protocol_counts.values()) if self.protocol_counts else 0
-        protocol_pct = {}
-        for proto, count in self.protocol_counts.most_common():
-            protocol_pct[proto] = {
-                'count': count,
-                'percentage': round(count / total * 100, 2) if total > 0 else 0,
-            }
-        top_ports = self.port_counts.most_common(20)
-        top_src = self.ip_src_counts.most_common(10)
-        top_dst = self.ip_dst_counts.most_common(10)
+        total = sum(self.protocol_counts.values())
+        protocol_pct = {
+            proto: {"count": c, "percentage": round(c / total * 100, 2) if total else 0}
+            for proto, c in self.protocol_counts.most_common()
+        }
         sizes = self.packet_sizes
         return {
-            'total_packets': total,
-            'total_bytes': sum(sizes),
-            'avg_packet_size': round(sum(sizes) / len(sizes), 2) if sizes else 0,
-            'min_packet_size': min(sizes) if sizes else 0,
-            'max_packet_size': max(sizes) if sizes else 0,
-            'protocol_distribution': protocol_pct,
-            'top_source_ips': [{'ip': ip, 'count': c} for ip, c in top_src],
-            'top_destination_ips': [{'ip': ip, 'count': c} for ip, c in top_dst],
-            'top_ports': [{'port': p, 'count': c} for p, c in top_ports],
+            "total_packets": total,
+            "total_bytes": sum(sizes),
+            "avg_packet_size": round(sum(sizes) / len(sizes), 2) if sizes else 0,
+            "min_packet_size": min(sizes) if sizes else 0,
+            "max_packet_size": max(sizes) if sizes else 0,
+            "protocol_distribution": protocol_pct,
+            "top_source_ips": [{"ip": ip, "count": c} for ip, c in self.ip_src_counts.most_common(10)],
+            "top_destination_ips": [{"ip": ip, "count": c} for ip, c in self.ip_dst_counts.most_common(10)],
+            "top_ports": [{"port": p, "count": c} for p, c in self.port_counts.most_common(20)],
         }
 
 
 class AnomalyDetector:
-    """Detect anomalous network behavior."""
-
     def __init__(self):
         self.ip_packet_counts = collections.Counter()
         self.ip_byte_counts = collections.Counter()
@@ -370,251 +303,300 @@ class AnomalyDetector:
         self.anomalies = []
 
     def analyze_packet(self, packet, ip_info, transport_info):
-        """Check a packet for anomalous indicators."""
         if not ip_info:
             return
-        src_ip = ip_info['src_ip']
+        src_ip = ip_info["src_ip"]
         self.ip_packet_counts[src_ip] += 1
-        self.ip_byte_counts[src_ip] += ip_info['total_length']
-
-        if transport_info and 'flags' in transport_info:
-            flags = transport_info['flags']
-            if 'SYN' in flags and 'ACK' not in flags:
-                dst_port = transport_info.get('dst_port', 0)
+        self.ip_byte_counts[src_ip] += ip_info["total_length"]
+        if transport_info and "flags" in transport_info:
+            flags = transport_info["flags"]
+            if "SYN" in flags and "ACK" not in flags:
+                dst_port = transport_info.get("dst_port", 0)
                 self.port_scan_suspects[src_ip].add(dst_port)
                 self.syn_flood_suspects[src_ip] += 1
 
     def detect_anomalies(self, packet_threshold=1000, syn_threshold=100, scan_threshold=20):
-        """Run anomaly detection on collected data. Returns list of anomalies."""
         self.anomalies = []
-
         for ip, count in self.ip_packet_counts.items():
             if count > packet_threshold:
                 self.anomalies.append({
-                    'type': 'HIGH_VOLUME',
-                    'severity': 'HIGH',
-                    'source_ip': ip,
-                    'description': f'IP {ip} sent {count} packets (threshold: {packet_threshold})',
+                    "type": "HIGH_VOLUME",
+                    "severity": "HIGH",
+                    "source_ip": ip,
+                    "description": f"IP {ip} sent {count} packets (threshold: {packet_threshold})",
                 })
-
         for ip, byte_count in self.ip_byte_counts.items():
             if byte_count > packet_threshold * 1400:
                 self.anomalies.append({
-                    'type': 'HIGH_BANDWIDTH',
-                    'severity': 'MEDIUM',
-                    'source_ip': ip,
-                    'description': f'IP {ip} transferred {byte_count} bytes',
+                    "type": "HIGH_BANDWIDTH",
+                    "severity": "MEDIUM",
+                    "source_ip": ip,
+                    "description": f"IP {ip} transferred {byte_count} bytes",
                 })
-
         for ip, ports in self.port_scan_suspects.items():
             if len(ports) > scan_threshold:
                 self.anomalies.append({
-                    'type': 'PORT_SCAN',
-                    'severity': 'HIGH',
-                    'source_ip': ip,
-                    'description': f'IP {ip} probed {len(ports)} unique ports',
-                    'ports_sample': list(ports)[:50],
+                    "type": "PORT_SCAN",
+                    "severity": "HIGH",
+                    "source_ip": ip,
+                    "description": f"IP {ip} probed {len(ports)} unique ports",
+                    "ports_sample": list(ports)[:50],
                 })
-
         for ip, syn_count in self.syn_flood_suspects.items():
             if syn_count > syn_threshold:
                 self.anomalies.append({
-                    'type': 'SYN_FLOOD',
-                    'severity': 'CRITICAL',
-                    'source_ip': ip,
-                    'description': f'IP {ip} sent {syn_count} SYN packets without ACK',
+                    "type": "SYN_FLOOD",
+                    "severity": "CRITICAL",
+                    "source_ip": ip,
+                    "description": f"IP {ip} sent {syn_count} SYN packets without ACK",
                 })
-
         return self.anomalies
 
 
 class BandwidthAnalyzer:
-    """Analyze bandwidth usage over time."""
-
     def __init__(self, bucket_seconds=1.0):
         self.bucket_seconds = bucket_seconds
-        self.buckets = collections.defaultdict(lambda: {'bytes': 0, 'packets': 0})
+        self.buckets = collections.defaultdict(lambda: {"bytes": 0, "packets": 0})
 
     def add_packet(self, packet, ip_info=None):
-        """Add a packet to the bandwidth buckets."""
-        bucket = int(packet['timestamp'] / self.bucket_seconds) * self.bucket_seconds
-        self.buckets[bucket]['bytes'] += packet['length']
-        self.buckets[bucket]['packets'] += 1
+        bucket = int(packet["timestamp"] / self.bucket_seconds) * self.bucket_seconds
+        self.buckets[bucket]["bytes"] += packet["length"]
+        self.buckets[bucket]["packets"] += 1
 
     def get_timeline(self):
-        """Return bandwidth over time as sorted list."""
         timeline = []
         for ts in sorted(self.buckets.keys()):
             b = self.buckets[ts]
             timeline.append({
-                'timestamp': ts,
-                'bytes': b['bytes'],
-                'packets': b['packets'],
-                'bits_per_second': b['bytes'] * 8 / self.bucket_seconds,
+                "timestamp": round(ts, 3),
+                "bytes": b["bytes"],
+                "packets": b["packets"],
+                "bits_per_second": b["bytes"] * 8 / self.bucket_seconds,
             })
         return timeline
 
     def get_summary(self):
-        """Return bandwidth summary statistics."""
         timeline = self.get_timeline()
         if not timeline:
-            return {'peak_bps': 0, 'avg_bps': 0, 'total_bytes': 0, 'total_packets': 0}
-        total_bytes = sum(t['bytes'] for t in timeline)
-        total_packets = sum(t['packets'] for t in timeline)
-        bps_values = [t['bits_per_second'] for t in timeline]
+            return {"peak_bps": 0, "avg_bps": 0, "total_bytes": 0, "total_packets": 0}
+        total_bytes = sum(t["bytes"] for t in timeline)
+        total_packets = sum(t["packets"] for t in timeline)
+        bps_values = [t["bits_per_second"] for t in timeline]
         return {
-            'peak_bps': max(bps_values),
-            'avg_bps': round(sum(bps_values) / len(bps_values), 2),
-            'total_bytes': total_bytes,
-            'total_packets': total_packets,
-            'time_span_seconds': round(timeline[-1]['timestamp'] - timeline[0]['timestamp'], 3) if len(timeline) > 1 else 0,
-            'num_buckets': len(timeline),
+            "peak_bps": max(bps_values),
+            "avg_bps": round(sum(bps_values) / len(bps_values), 2),
+            "total_bytes": total_bytes,
+            "total_packets": total_packets,
+            "time_span_seconds": round(timeline[-1]["timestamp"] - timeline[0]["timestamp"], 3) if len(timeline) > 1 else 0,
+            "num_buckets": len(timeline),
         }
 
 
 class TrafficAnalyzer:
-    """Main analyzer combining all components."""
-
     def __init__(self):
         self.pcap_parser = PcapParser()
-        self.eth_parser = EthernetParser()
-        self.ip_parser = IPParser()
-        self.tcp_parser = TCPParser()
-        self.udp_parser = UDPParser()
         self.flow_reconstructor = FlowReconstructor()
         self.protocol_analyzer = ProtocolAnalyzer()
         self.anomaly_detector = AnomalyDetector()
         self.bandwidth_analyzer = BandwidthAnalyzer()
         self.results = {}
 
-    def analyze_pcap(self, filepath):
-        """Full analysis pipeline on a pcap file."""
-        packets = self.pcap_parser.parse_file(filepath)
-        self._process_packets(packets)
-        return self.generate_report()
-
     def analyze_bytes(self, pcap_bytes):
-        """Full analysis pipeline on pcap bytes."""
         packets = self.pcap_parser.parse_bytes(pcap_bytes)
-        self._process_packets(packets)
-        return self.generate_report()
+        return self._process_packets(packets)
+
+    def analyze_pcap(self, filepath):
+        packets = self.pcap_parser.parse_file(filepath)
+        return self._process_packets(packets)
 
     def _process_packets(self, packets):
-        """Process all packets through the analysis pipeline."""
         for packet in packets:
-            data = packet['data']
-            eth = self.eth_parser.parse(data)
+            data = packet["data"]
+            eth = EthernetParser.parse(data)
             if eth is None:
                 continue
-
             ip_info = None
             transport_info = None
-
-            if eth['ethertype'] == 0x0800:
-                ip_info = self.ip_parser.parse(eth['payload'])
+            if eth["ethertype"] == 0x0800:
+                ip_info = IPParser.parse(eth["payload"])
                 if ip_info:
-                    if ip_info['protocol_name'] == 'TCP':
-                        transport_info = self.tcp_parser.parse(ip_info['payload'])
-                    elif ip_info['protocol_name'] == 'UDP':
-                        transport_info = self.udp_parser.parse(ip_info['payload'])
-
+                    if ip_info["protocol_name"] == "TCP":
+                        transport_info = TCPParser.parse(ip_info["payload"])
+                    elif ip_info["protocol_name"] == "UDP":
+                        transport_info = UDPParser.parse(ip_info["payload"])
             if ip_info:
-                self.flow_reconstructor.add_packet(packet, ip_info, transport_info or {'src_port': 0, 'dst_port': 0})
+                self.flow_reconstructor.add_packet(packet, ip_info, transport_info)
                 self.protocol_analyzer.analyze_packet(packet, ip_info, transport_info)
                 self.anomaly_detector.analyze_packet(packet, ip_info, transport_info)
                 self.bandwidth_analyzer.add_packet(packet, ip_info)
+        return self.generate_report()
 
     def generate_report(self):
-        """Generate a complete analysis report."""
         self.results = {
-            'analysis_time': datetime.now().isoformat(),
-            'protocol_stats': self.protocol_analyzer.get_stats(),
-            'flow_stats': self.flow_reconstructor.get_flow_stats(),
-            'anomalies': self.anomaly_detector.detect_anomalies(),
-            'bandwidth': self.bandwidth_analyzer.get_summary(),
-            'bandwidth_timeline': self.bandwidth_analyzer.get_timeline(),
+            "analysis_time": datetime.now().isoformat(),
+            "protocol_stats": self.protocol_analyzer.get_stats(),
+            "flow_stats": self.flow_reconstructor.get_flow_stats(),
+            "anomalies": self.anomaly_detector.detect_anomalies(),
+            "bandwidth": self.bandwidth_analyzer.get_summary(),
+            "bandwidth_timeline": self.bandwidth_analyzer.get_timeline(),
         }
         return self.results
 
-    def export_json(self, filepath):
-        """Export results to JSON."""
-        def default_serializer(obj):
-            if isinstance(obj, set):
-                return list(obj)
-            if isinstance(obj, datetime):
-                return obj.isoformat()
-            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-        with open(filepath, 'w') as f:
-            json.dump(self.results, f, indent=2, default=default_serializer)
+    def to_json(self):
+        return json.dumps(self.results, indent=2, default=lambda o: repr(o))
+
+    def to_markdown(self):
+        ps = self.results["protocol_stats"]
+        lines = ["# R1 Traffic Analyzer Report", ""]
+        lines.append(f"- Analysis time: {self.results['analysis_time']}")
+        lines.append(f"- Total packets: {ps['total_packets']}")
+        lines.append(f"- Total bytes: {ps['total_bytes']}")
+        lines.append("")
+        lines.append("## Protocol Distribution")
+        lines.append("| Protocol | Count | % |")
+        lines.append("|----------|-------|---|")
+        for proto, info in ps["protocol_distribution"].items():
+            lines.append(f"| {proto} | {info['count']} | {info['percentage']}% |")
+        lines.append("")
+        lines.append("## Flows")
+        lines.append(f"Total flows: {len(self.results['flow_stats'])}")
+        lines.append("")
+        lines.append("## Anomalies")
+        if self.results["anomalies"]:
+            for a in self.results["anomalies"]:
+                lines.append(f"- [{a['severity']}] {a['type']}: {a['description']}")
+        else:
+            lines.append("None")
+        lines.append("")
+        lines.append("## Bandwidth")
+        b = self.results["bandwidth"]
+        lines.append(f"- Peak: {b['peak_bps']} bps, Avg: {b['avg_bps']} bps")
+        return "\n".join(lines)
 
 
-def create_test_pcap():
-    """Create a minimal test pcap in memory for unit testing."""
-    import io
-    buf = io.BytesIO()
+def write_report(report_dir, results_json, markdown):
+    os.makedirs(report_dir, exist_ok=True)
+    json_path = os.path.join(report_dir, "r1_report.json")
+    md_path = os.path.join(report_dir, "r1_report.md")
+    with open(json_path, "w") as f:
+        f.write(results_json)
+    with open(md_path, "w") as f:
+        f.write(markdown)
+    return json_path, md_path
 
-    magic = 0xa1b2c3d4
-    version_major = 2
-    version_minor = 4
-    thiszone = 0
-    sigfigs = 0
-    snaplen = 65535
-    network = 1  # LINKTYPE_ETHERNET
 
-    hdr_fmt = '=IHHiIII'
-    buf.write(struct.pack(hdr_fmt, magic, version_major, version_minor, thiszone, sigfigs, snaplen, network))
+def make_fixture_pcap():
+    """Create a deterministic pcap fixture with a realistic mix of packets."""
+    buf = bytearray()
+    magic = 0xA1B2C3D4
+    hdr_fmt = "=IHHiIII"
+    buf += struct.pack(hdr_fmt, magic, 2, 4, 0, 0, 65535, 1)
+    pkt_hdr_fmt = "=IIII"
 
-    pkt_hdr_fmt = '=IIII'
-
-    for i in range(5):
-        src_ip = [192, 168, 1, 10 + i]
-        dst_ip = [192, 168, 1, 1]
+    def build_packet(src_ip, dst_ip, proto, sport, dport, flags=0x18, payload=b""):
         ip_header = bytearray(20)
         ip_header[0] = 0x45
-        ip_header[2:4] = struct.pack('!H', 40)
+        ip_header[2:4] = struct.pack("!H", 20 + 20 + len(payload))
         ip_header[8] = 64
-        ip_header[9] = 6
-        ip_header[12:16] = bytes(src_ip)
-        ip_header[16:20] = bytes(dst_ip)
-
+        ip_header[9] = proto
+        ip_header[12:16] = bytes([int(x) for x in src_ip.split(".")])
+        ip_header[16:20] = bytes([int(x) for x in dst_ip.split(".")])
         tcp_header = bytearray(20)
-        tcp_header[0:2] = struct.pack('!H', 12345)
-        tcp_header[2:4] = struct.pack('!H', 80)
+        tcp_header[0:2] = struct.pack("!H", sport)
+        tcp_header[2:4] = struct.pack("!H", dport)
         tcp_header[12] = 0x50
-        tcp_header[13] = 0x18
-
-        payload = b'GET / HTTP/1.1\r\nHost: test\r\n\r\n'
-
+        tcp_header[13] = flags
+        if proto == 17:
+            udp_header = bytearray(8)
+            udp_header[0:2] = struct.pack("!H", sport)
+            udp_header[2:4] = struct.pack("!H", dport)
+            udp_header[4:6] = struct.pack("!H", 8 + len(payload))
+            transport = bytes(udp_header) + payload
+            ip_header[2:4] = struct.pack("!H", 20 + len(transport))
+        else:
+            transport = bytes(tcp_header) + payload
         eth_header = bytearray(14)
-        eth_header[12:14] = struct.pack('!H', 0x0800)
+        eth_header[12:14] = struct.pack("!H", 0x0800)
+        pkt_data = bytes(eth_header) + bytes(ip_header) + transport
+        return pkt_data
 
-        pkt_data = bytes(eth_header) + bytes(ip_header) + bytes(tcp_header) + payload
-        ts_sec = 1700000000 + i
-        ts_usec = i * 100000
-        incl_len = len(pkt_data)
-        orig_len = incl_len
-        buf.write(struct.pack(pkt_hdr_fmt, ts_sec, ts_usec, incl_len, orig_len))
-        buf.write(pkt_data)
+    packets_data = []
+    # TCP traffic
+    for i in range(10):
+        packets_data.append(build_packet("192.168.1.10", "192.168.1.1", 6, 12345, 80, 0x18, b"GET / HTTP/1.1\r\n\r\n"))
+    # TCP SYN to many ports (port scan)
+    for port in range(1, 30):
+        packets_data.append(build_packet("10.0.0.5", "10.0.0.1", 6, 40000 + port, port, 0x02))
+    # UDP DNS
+    for i in range(5):
+        packets_data.append(build_packet("192.168.1.10", "8.8.8.8", 17, 5353, 53))
+    # ICMP-ish (use UDP as proxy not needed; keep protocol 6/17 only for parser)
+    # High-bandwidth burst
+    for i in range(20):
+        packets_data.append(build_packet("192.168.1.20", "192.168.1.1", 6, 50000 + i, 443, 0x18, b"A" * 1400))
 
-    return buf.getvalue()
+    ts_sec = 1700000000
+    ts_usec = 0
+    for i, pkt in enumerate(packets_data):
+        ts_sec_i = ts_sec + i // 100
+        ts_usec_i = (i % 100) * 10000
+        buf += struct.pack(pkt_hdr_fmt, ts_sec_i, ts_usec_i, len(pkt), len(pkt))
+        buf += pkt
+    return bytes(buf)
 
 
-if __name__ == '__main__':
-    print("=== R1 — Network Traffic Analyzer ===")
-    print("Creating test pcap data...")
-    test_pcap = create_test_pcap()
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="traffic_analyzer",
+        description="R1 — Network Traffic Analyzer v2: pcap parsing, flows, anomalies, bandwidth.",
+    )
+    parser.add_argument("pcap", nargs="?", help="Path to a pcap file. If omitted, uses the built-in fixture.")
+    parser.add_argument("-o", "--report-dir", default="reports",
+                        help="Directory to write reports to (default: reports)")
+    parser.add_argument("--json-only", action="store_true", help="Only print JSON report")
+    args = parser.parse_args(argv)
 
     analyzer = TrafficAnalyzer()
-    print("Analyzing packets...")
-    results = analyzer.analyze_bytes(test_pcap)
+    if args.pcap:
+        results = analyzer.analyze_pcap(args.pcap)
+        src_label = f"pcap: {args.pcap}"
+    else:
+        fixture = make_fixture_pcap()
+        results = analyzer.analyze_bytes(fixture)
+        src_label = "built-in fixture"
 
-    print(f"\nProtocol Distribution:")
-    for proto, info in results['protocol_stats']['protocol_distribution'].items():
-        print(f"  {proto}: {info['count']} packets ({info['percentage']}%)")
+    print("=" * 60)
+    print("  R1 — Network Traffic Analyzer v2")
+    print("=" * 60)
+    print(f"  Source      : {src_label}")
+    print(f"  Total packets: {results['protocol_stats']['total_packets']}")
+    print(f"  Total bytes : {results['protocol_stats']['total_bytes']}")
+    print(f"  Flows       : {len(results['flow_stats'])}")
+    print(f"  Anomalies   : {len(results['anomalies'])}")
+    print(f"  Peak BW     : {results['bandwidth']['peak_bps']} bps")
+    print()
+    print("  Protocol Distribution:")
+    for proto, info in results["protocol_stats"]["protocol_distribution"].items():
+        print(f"    {proto}: {info['count']} ({info['percentage']}%)")
+    print()
+    print("  Anomalies:")
+    for a in results["anomalies"]:
+        print(f"    [{a['severity']}] {a['type']}: {a['description']}")
 
-    print(f"\nTotal Packets: {results['protocol_stats']['total_packets']}")
-    print(f"Total Bytes: {results['protocol_stats']['total_bytes']}")
-    print(f"Flows Detected: {len(results['flow_stats'])}")
-    print(f"Anomalies Found: {len(results['anomalies'])}")
-    print(f"Peak Bandwidth: {results['bandwidth']['peak_bps']} bps")
-    print("\nAnalysis complete.")
+    json_str = analyzer.to_json()
+    md_str = analyzer.to_markdown()
+    json_path, md_path = write_report(args.report_dir, json_str, md_str)
+    print()
+    print(f"  Reports written to:")
+    print(f"    {json_path}")
+    print(f"    {md_path}")
+
+    if args.json_only:
+        print(json_str)
+
+    print("\n  Analysis complete — exit 0")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
