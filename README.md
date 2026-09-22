@@ -1,3 +1,8 @@
+> **⚠️ EDUCATIONAL USE ONLY — AUTHORIZED TESTING ONLY.**
+> This project exists for education, research, and **defense of systems you own
+> or hold explicit written authorization to assess**. Unauthorized use is
+> prohibited and may be illegal. Read [ETHICS.md](ETHICS.md) and
+> [SCOPE.md](SCOPE.md) before use. Use at your own risk; **AS IS**, no warranty.
 # R1 — Network Traffic Analyzer v2
 
 Real pcap parsing, flow reconstruction, protocol statistics, anomaly detection, bandwidth analysis, and JSON/Markdown reporting. Rebuild of the legacy `traffic_analyzer.py` into a working, tested baseline.
